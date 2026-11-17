@@ -342,26 +342,32 @@ def validate_and_compact_item(
     if test_z + cand_d > cl + 0.1:
       continue
 
-    # 2. Drop downward along Y (gravity & base support check at compacted Z)
+    # 2. Drop downward along Y & sum total base support across ALL touching boxes at max_underneath_y
     max_underneath_y = 0.0
-    supporting_surface_area = 0.0
-
     for val_item in validated_items:
       vx, vy, vz = [float(p) for p in val_item.position]
       vw, vh, vd = get_actual_dims(val_item)
 
       x_overlap_len = max(0.0, min(ix + cand_w, vx + vw) - max(ix, vx))
       z_overlap_len = max(0.0, min(test_z + cand_d, vz + vd) - max(test_z, vz))
-      overlap_area = x_overlap_len * z_overlap_len
-
-      if overlap_area > 0 and (vy + vh <= iy + 0.1):
-        top_y = vy + vh
-        if top_y > max_underneath_y:
-          max_underneath_y = top_y
-          supporting_surface_area = overlap_area
+      if x_overlap_len > 0.1 and z_overlap_len > 0.1 and (vy + vh <= iy + 0.1):
+        if vy + vh > max_underneath_y:
+          max_underneath_y = vy + vh
 
     if max_underneath_y + cand_h > ch + 0.1:
       continue
+
+    supporting_surface_area = 0.0
+    if max_underneath_y > 0:
+      for val_item in validated_items:
+        vx, vy, vz = [float(p) for p in val_item.position]
+        vw, vh, vd = get_actual_dims(val_item)
+        if abs((vy + vh) - max_underneath_y) < 0.1:
+          x_overlap_len = max(0.0, min(ix + cand_w, vx + vw) - max(ix, vx))
+          z_overlap_len = max(
+              0.0, min(test_z + cand_d, vz + vd) - max(test_z, vz)
+          )
+          supporting_surface_area += x_overlap_len * z_overlap_len
 
     base_area = cand_w * cand_d
     support_ratio = (
@@ -586,14 +592,31 @@ def run_py3dbp_packing_engine(
 
     for _, row in group_df.iterrows():
       qty = int(row["Qty"])
+      is_full_rot = (
+          row["Allow_X"] == 1 and row["Allow_Y"] == 1 and row["Allow_Z"] == 1
+      )
       for i in range(qty):
-        item = Item(
-            str(f"{row['Box_Name']} #{i+1}"),
-            int(row["Width_cm"]),
-            int(row["Height_cm"]),
-            int(row["Length_cm"]),
-            float(row["Weight_kg"]),
-        )
+        if is_full_rot:
+          # Pre-orient full-rotation boxes (e.g. Box B 60x80x40 -> 40x80x60)
+          # so they pack with the narrowest Width (40cm) and shortest Length (60cm)
+          s_dims = sorted(
+              [int(row["Width_cm"]), int(row["Height_cm"]), int(row["Length_cm"])]
+          )
+          item = Item(
+              str(f"{row['Box_Name']} #{i+1}"),
+              s_dims[0],
+              s_dims[2],
+              s_dims[1],
+              float(row["Weight_kg"]),
+          )
+        else:
+          item = Item(
+              str(f"{row['Box_Name']} #{i+1}"),
+              int(row["Width_cm"]),
+              int(row["Height_cm"]),
+              int(row["Length_cm"]),
+              float(row["Weight_kg"]),
+          )
         configure_item_rotations(
             item, row["Allow_X"], row["Allow_Y"], row["Allow_Z"]
         )
