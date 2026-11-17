@@ -263,11 +263,16 @@ def run_py3dbp_packing_engine(
     return [], []
 
   box_df_sorted = box_orders_df.sort_values(
-      by=["Priority_Level", "Weight_kg"], ascending=[True, False]
+      by=["Priority_Level", "Weight_kg", "Height_cm"],
+      ascending=[True, False, False],
   )
   all_fitted_items = []
 
-  for _, row in box_df_sorted.iterrows():
+  # Group by Priority_Level so same-priority SKUs pack together in one pass
+  # (allowing Pallet D [100cm] to stack on top of Pallet C [120cm])
+  for priority_lvl, group_df in box_df_sorted.groupby(
+      "Priority_Level", sort=True
+  ):
     packer = Packer()
     temp_bin = Bin(
         str(container_info["Container_Name"]), cw, ch, cl, max_w
@@ -295,23 +300,24 @@ def run_py3dbp_packing_engine(
 
     packer.add_bin(temp_bin)
 
-    qty = int(row["Qty"])
-    for i in range(qty):
-      item = Item(
-          str(f"{row['Box_Name']} #{i+1}"),
-          int(row["Width_cm"]),
-          int(row["Height_cm"]),
-          int(row["Length_cm"]),
-          float(row["Weight_kg"]),
-      )
-      # Keep items upright (only allow horizontal Width <-> Length rotation)
-      item.updown = False
-      item.color = str(row["Color"])
-      item.box_id = str(row["Box_ID"])
-      item.box_name = str(row["Box_Name"])
-      item.customer_name = str(row["Customer_Name"])
-      item.lbs_z = float(row["LBS_z"])
-      packer.add_item(item)
+    for _, row in group_df.iterrows():
+      qty = int(row["Qty"])
+      for i in range(qty):
+        item = Item(
+            str(f"{row['Box_Name']} #{i+1}"),
+            int(row["Width_cm"]),
+            int(row["Height_cm"]),
+            int(row["Length_cm"]),
+            float(row["Weight_kg"]),
+        )
+        # Keep items upright (only allow horizontal Width <-> Length rotation)
+        item.updown = False
+        item.color = str(row["Color"])
+        item.box_id = str(row["Box_ID"])
+        item.box_name = str(row["Box_Name"])
+        item.customer_name = str(row["Customer_Name"])
+        item.lbs_z = float(row["LBS_z"])
+        packer.add_item(item)
 
     packer.pack(
         bigger_first=True, distribute_items=False, number_of_decimals=0
