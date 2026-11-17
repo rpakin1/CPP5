@@ -1,5 +1,6 @@
 from decimal import Decimal
 import math
+import types
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -7,7 +8,6 @@ import streamlit as st
 # Safe import for py3dbp
 try:
   from py3dbp import Bin, Item, Packer
-  from py3dbp.constants import RotationType
 except ModuleNotFoundError:
   st.error(
       "❌ **Missing Dependency:** ไม่พบแพ็กเกจ `py3dbp` โปรดติดตั้งโดยรันคำสั่ง"
@@ -141,7 +141,6 @@ def assign_box_colors(df_b):
 box_colors_map = assign_box_colors(df_box)
 
 
-# Helper to safely extract actual post-rotation dimensions from py3dbp Item
 def get_actual_dims(item):
   if hasattr(item, "get_dimension"):
     dims = item.get_dimension()
@@ -149,26 +148,38 @@ def get_actual_dims(item):
   return float(item.width), float(item.height), float(item.depth)
 
 
-# Map Allow_X, Allow_Y, Allow_Z from Master Data to allowed py3dbp rotation_types
-# py3dbp RotationTypes (where item initialized as W, H, D):
-# 0: (W, H, D) - Original upright
-# 1: (H, W, D) - Tipped sideways (roll around Z)
-# 2: (H, D, W) - Tipped & spun
-# 3: (D, H, W) - Horizontal spin (yaw around vertical Y axis: W <-> D)
-# 4: (D, W, H) - Tipped forward & spun
-# 5: (W, D, H) - Tipped forward (pitch around X axis: H <-> D)
-def get_allowed_rotations(allow_x, allow_y, allow_z):
-  allowed = [0]  # Original orientation is always allowed
+# Enforce exact Allow_X, Allow_Y, Allow_Z rules inside py3dbp's get_dimension()
+def configure_item_rotations(item, allow_x, allow_y, allow_z):
+  allowed = [0]
   if allow_z == 1 or allow_y == 1:
-    # Horizontal spin (Width <-> Length while keeping Height upright)
-    allowed.append(3)
+    allowed.append(3)  # Horizontal spin (Width <-> Length, Height upright)
   if allow_x == 1:
-    # Tip forward/backward (Height <-> Length)
-    allowed.extend([4, 5])
+    allowed.extend([4, 5])  # Tip forward/backward
   if allow_x == 1 and (allow_y == 1 or allow_z == 1):
-    # Full 6-way orientation (e.g. Box B with Allow_X=1, Allow_Y=1, Allow_Z=1)
-    allowed = [0, 1, 2, 3, 4, 5]
-  return sorted(list(set(allowed)))
+    allowed = [0, 1, 2, 3, 4, 5]  # All 6 orientations
+
+  allowed = sorted(list(set(allowed)))
+  item.allowed_rotations = allowed
+  item.updown = len(allowed) > 2
+
+  # Override get_dimension so py3dbp maps disallowed rotation_types back to rotation 0
+  def strict_get_dimension(self):
+    rt = self.rotation_type if self.rotation_type in self.allowed_rotations else 0
+    if rt == 0:
+      return [self.width, self.height, self.depth]
+    elif rt == 1:
+      return [self.height, self.width, self.depth]
+    elif rt == 2:
+      return [self.height, self.depth, self.width]
+    elif rt == 3:
+      return [self.depth, self.height, self.width]
+    elif rt == 4:
+      return [self.depth, self.width, self.height]
+    elif rt == 5:
+      return [self.width, self.depth, self.height]
+    return [self.width, self.height, self.depth]
+
+  item.get_dimension = types.MethodType(strict_get_dimension, item)
 
 
 # ------------------------------------------------------------------------------
@@ -284,7 +295,7 @@ def build_locked_bin(container_info, cw, ch, cl, max_w, locked_items):
     fixed_item.box_name = getattr(fitted, "box_name", "UNKNOWN")
     fixed_item.customer_name = getattr(fitted, "customer_name", "UNKNOWN")
     fixed_item.lbs_z = getattr(fitted, "lbs_z", float("inf"))
-    fixed_item.allowed_rotations = [0]
+    configure_item_rotations(fixed_item, 0, 0, 0)
     temp_bin.items.append(fixed_item)
   return temp_bin
 
@@ -295,8 +306,6 @@ def validate_and_compact_item(
   ix, iy, iz = [float(p) for p in item.position]
   orig_w, orig_h, orig_d = get_actual_dims(item)
 
-  # Build candidate dimension pairs to test (if horizontal rotation is allowed,
-  # try the proposed orientation first, then try swapping W <-> D if support fails)
   allowed_rots = getattr(item, "allowed_rotations", [0])
   can_spin_horiz = (3 in allowed_rots) or (len(allowed_rots) == 6)
 
@@ -370,11 +379,11 @@ def validate_and_compact_item(
         and (support_ratio >= support_surface_ratio)
         and is_lbsz_safe
     ):
-      # Apply validated dimensions & position
       item.width = Decimal(str(int(round(cand_w))))
       item.height = Decimal(str(int(round(cand_h))))
       item.depth = Decimal(str(int(round(cand_d))))
       item.rotation_type = 0
+      configure_item_rotations(item, 0, 0, 0)
       item.position = candidate_pos
       return True
 
@@ -395,10 +404,6 @@ def run_py3dbp_packing_engine(
   for item in user_box_orders:
     b = item["info"]
     lbs_val = float(b.get("LBS_z", b.get("lbs_z", float("inf"))))
-    # Assign smart packing tier if Priority_Level is absent:
-    # Tier 1: Heavy/strong load-bearing pallets (LBS_z >= 500)
-    # Tier 2: Medium load-bearing boxes (10 < LBS_z < 500)
-    # Tier 3: Fragile / non-stackable top-only items (LBS_z <= 10, e.g., Box B with LBS_z=1)
     if "Priority_Level" in b and not pd.isna(b["Priority_Level"]):
       prio = int(b["Priority_Level"])
     else:
@@ -433,8 +438,7 @@ def run_py3dbp_packing_engine(
   validated_items = []
   unfitted_pool = []
 
-  # Pass 1: Pack by Load-Bearing / Priority Tier, validating & compacting immediately
-  # so rejected boxes don't block empty space for subsequent tiers
+  # Pass 1: Pack by Priority/Load-Bearing Tier with strict sheet rotation rules
   for _, group_df in box_df_sorted.groupby("Priority_Level", sort=True):
     packer = Packer()
     temp_bin = build_locked_bin(
@@ -443,9 +447,6 @@ def run_py3dbp_packing_engine(
     packer.add_bin(temp_bin)
 
     for _, row in group_df.iterrows():
-      allowed_rots = get_allowed_rotations(
-          row["Allow_X"], row["Allow_Y"], row["Allow_Z"]
-      )
       qty = int(row["Qty"])
       for i in range(qty):
         item = Item(
@@ -455,9 +456,9 @@ def run_py3dbp_packing_engine(
             int(row["Length_cm"]),
             float(row["Weight_kg"]),
         )
-        # Enable full rotation only if Allow_X=1; otherwise keep upright
-        item.updown = row["Allow_X"] == 1
-        item.allowed_rotations = allowed_rots
+        configure_item_rotations(
+            item, row["Allow_X"], row["Allow_Y"], row["Allow_Z"]
+        )
         item.color = str(row["Color"])
         item.box_id = str(row["Box_ID"])
         item.box_name = str(row["Box_Name"])
@@ -489,8 +490,7 @@ def run_py3dbp_packing_engine(
     for unf in packer.bins[0].unfitted_items:
       unfitted_pool.append(unf)
 
-  # Pass 2: Retry any remaining unfitted boxes (including tipped/rotated orientations)
-  # into whatever gaps remain on top of pallets or along the side aisle
+  # Pass 2: Retry any remaining unfitted items into open upper-tier and side-lane gaps
   if unfitted_pool:
     packer_retry = Packer()
     retry_bin = build_locked_bin(
@@ -500,19 +500,18 @@ def run_py3dbp_packing_engine(
 
     for item in unfitted_pool:
       allowed_rots = getattr(item, "allowed_rotations", [0])
-      # If full 6-way rotation is allowed (e.g. Box B), pre-orient flattest/narrowest
-      # face (Height=40 -> Width=40) so it slides into the 55cm side lane
       if len(allowed_rots) == 6:
+        # Orient Box B (60x80x40) with its 40cm side along Width (40x60x80)
+        # so it fits cleanly into the 55cm right aisle!
         dims = sorted([
             int(round(float(item.width))),
             int(round(float(item.height))),
             int(round(float(item.depth))),
         ])
-        # dims = [40, 60, 80] -> Width=40, Height=60, Length=80 (fits 55cm side aisle!)
         retry_item = Item(
             item.name, dims[0], dims[1], dims[2], float(item.weight)
         )
-        retry_item.updown = True
+        configure_item_rotations(retry_item, 1, 1, 1)
       else:
         retry_item = Item(
             item.name,
@@ -521,9 +520,12 @@ def run_py3dbp_packing_engine(
             int(round(float(item.depth))),
             float(item.weight),
         )
-        retry_item.updown = getattr(item, "updown", False)
+        retry_item.allowed_rotations = allowed_rots
+        retry_item.updown = len(allowed_rots) > 2
+        retry_item.get_dimension = types.MethodType(
+            item.get_dimension.__func__, retry_item
+        )
 
-      retry_item.allowed_rotations = allowed_rots
       retry_item.color = getattr(item, "color", "#3380FF")
       retry_item.box_id = getattr(item, "box_id", "N/A")
       retry_item.box_name = getattr(item, "box_name", item.name)
