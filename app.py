@@ -131,30 +131,35 @@ def assign_box_colors(df_b):
 box_colors_map = assign_box_colors(df_box)
 
 
+# Helper to safely extract actual post-rotation dimensions from py3dbp Item
+def get_actual_dims(item):
+  if hasattr(item, "get_dimension"):
+    dims = item.get_dimension()
+    return float(dims[0]), float(dims[1]), float(dims[2])
+  return float(item.width), float(item.height), float(item.depth)
+
+
 # ------------------------------------------------------------------------------
 # 2. TOP WEIGHT LBSz SAFETY CHECK FOR PY3DBP
 # ------------------------------------------------------------------------------
 def check_py3dbp_lbsz_safety(candidate_item, candidate_pos, validated_items):
   cx, cy, cz = candidate_pos
-  cw, ch, cd = (
-      float(candidate_item.width),
-      float(candidate_item.height),
-      float(candidate_item.depth),
-  )
+  cw, ch, cd = get_actual_dims(candidate_item)
 
   if cy == 0:
     return True
 
   all_items = []
   for item in validated_items:
+    iw, ih, id_len = get_actual_dims(item)
     all_items.append({
         "id": id(item),
         "x1": float(item.position[0]),
         "y1": float(item.position[1]),
         "z1": float(item.position[2]),
-        "x2": float(item.position[0]) + float(item.width),
-        "y2": float(item.position[1]) + float(item.height),
-        "z2": float(item.position[2]) + float(item.depth),
+        "x2": float(item.position[0]) + iw,
+        "y2": float(item.position[1]) + ih,
+        "z2": float(item.position[2]) + id_len,
         "weight": float(item.weight),
         "lbs_z": getattr(item, "lbs_z", float("inf")),
     })
@@ -268,14 +273,17 @@ def run_py3dbp_packing_engine(
     )
 
     for fitted in all_fitted_items:
+      # Preserve exact already-rotated dimensions and lock orientation (rotation_type=0)
+      fw, fh, fd = get_actual_dims(fitted)
       fixed_item = Item(
           fitted.name,
-          fitted.width,
-          fitted.height,
-          fitted.depth,
+          int(round(fw)),
+          int(round(fh)),
+          int(round(fd)),
           fitted.weight,
       )
       fixed_item.position = fitted.position
+      fixed_item.rotation_type = 0
       fixed_item.color = getattr(fitted, "color", "#7f7f7f")
       fixed_item.box_id = getattr(fitted, "box_id", "UNKNOWN")
       fixed_item.box_name = getattr(fitted, "box_name", "UNKNOWN")
@@ -294,6 +302,8 @@ def run_py3dbp_packing_engine(
           int(row["Length_cm"]),
           float(row["Weight_kg"]),
       )
+      # Keep items upright (only allow horizontal Width <-> Length rotation)
+      item.updown = False
       item.color = str(row["Color"])
       item.box_id = str(row["Box_ID"])
       item.box_name = str(row["Box_Name"])
@@ -317,18 +327,14 @@ def run_py3dbp_packing_engine(
   validated_items = []
   for item in all_fitted_items:
     ix, iy, iz = [float(p) for p in item.position]
-    iw, ih, id_len = float(item.width), float(item.height), float(item.depth)
+    iw, ih, id_len = get_actual_dims(item)
 
     max_underneath_y = 0.0
     supporting_surface_area = 0.0
 
     for val_item in validated_items:
       vx, vy, vz = [float(p) for p in val_item.position]
-      vw, vh, vd = (
-          float(val_item.width),
-          float(val_item.height),
-          float(val_item.depth),
-      )
+      vw, vh, vd = get_actual_dims(val_item)
 
       x_overlap_len = max(0.0, min(ix + iw, vx + vw) - max(ix, vx))
       z_overlap_len = max(0.0, min(iz + id_len, vz + vd) - max(iz, vz))
@@ -351,11 +357,7 @@ def run_py3dbp_packing_engine(
     has_collision = False
     for val_item in validated_items:
       val_pos = [float(p) for p in val_item.position]
-      val_dim = [
-          float(val_item.width),
-          float(val_item.height),
-          float(val_item.depth),
-      ]
+      val_dim = list(get_actual_dims(val_item))
       if is_overlapping_3d(candidate_pos, candidate_dim, val_pos, val_dim):
         has_collision = True
         break
@@ -377,7 +379,7 @@ def run_py3dbp_packing_engine(
 
   for item in validated_items:
     x1, y1, z1 = [float(p) for p in item.position]
-    bw, bh, bl = float(item.width), float(item.height), float(item.depth)
+    bw, bh, bl = get_actual_dims(item)
     b_id = getattr(item, "box_id", "N/A")
 
     placed_counts[b_id] = placed_counts.get(b_id, 0) + 1
@@ -814,6 +816,11 @@ with tab_user:
       loaded_qty = loaded_counts.get(b_id, 0)
       color = box_colors_map.get(b_id, "#FF5733")
 
+      w_cm = float(box.get("Width_cm", 0))
+      l_cm = float(box.get("Length_cm", 0))
+      h_cm = float(box.get("Height_cm", 0))
+      dim_str = f"{w_cm:.0f} × {l_cm:.0f} × {h_cm:.0f} cm"
+
       badge_bg = (
           "#2ECC71"
           if loaded_qty == requested_qty
@@ -824,10 +831,11 @@ with tab_user:
           f"""
             <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding: 8px; border-radius: 6px; background-color: #F8F9FA; border: 1px solid #E9ECEF;">
                 <div style="display: flex; align-items: center;">
-                    <div style="width: 18px; height: 18px; background-color: {color}; border-radius: 4px; margin-right: 10px;"></div>
+                    <div style="width: 18px; height: 18px; background-color: {color}; border-radius: 4px; margin-right: 10px; flex-shrink: 0;"></div>
                     <div>
                         <span style="font-size: 13px; font-weight: 600; color: #212529;">{box.get('Box_Name', b_id)}</span><br>
-                        <small style="color: #6C757D;">{box.get('Customer_Name', 'N/A')}</small>
+                        <small style="color: #6C757D;">{box.get('Customer_Name', 'N/A')}</small><br>
+                        <small style="color: #495057; font-weight: 500;">📐 {dim_str}</small>
                     </div>
                 </div>
                 <div>
