@@ -7,6 +7,7 @@ import streamlit as st
 # Safe import for py3dbp
 try:
   from py3dbp import Bin, Item, Packer
+  from py3dbp.constants import RotationType
 except ModuleNotFoundError:
   st.error(
       "❌ **Missing Dependency:** ไม่พบแพ็กเกจ `py3dbp` โปรดติดตั้งโดยรันคำสั่ง"
@@ -67,9 +68,11 @@ def load_master_data():
             "Length_cm": 50,
             "Height_cm": 30,
             "Weight_kg": 85,
+            "Allow_X": 0,
+            "Allow_Y": 0,
+            "Allow_Z": 1,
             "LBS_z": 300,
-            "Qty": 20,
-            "Priority_Level": 2,
+            "Qty": 10,
             "Color": "#ff7f0e",
         },
         {
@@ -80,10 +83,12 @@ def load_master_data():
             "Length_cm": 80,
             "Height_cm": 40,
             "Weight_kg": 35,
-            "LBS_z": 500,
-            "Qty": 15,
-            "Priority_Level": 2,
-            "Color": "#bcbd22",
+            "Allow_X": 1,
+            "Allow_Y": 1,
+            "Allow_Z": 1,
+            "LBS_z": 1,
+            "Qty": 10,
+            "Color": "#2ca02c",
         },
         {
             "Box_ID": "BOX-C",
@@ -93,9 +98,11 @@ def load_master_data():
             "Length_cm": 115,
             "Height_cm": 120,
             "Weight_kg": 511,
+            "Allow_X": 0,
+            "Allow_Y": 0,
+            "Allow_Z": 1,
             "LBS_z": 1500,
             "Qty": 10,
-            "Priority_Level": 1,
             "Color": "#1f77b4",
         },
         {
@@ -106,10 +113,12 @@ def load_master_data():
             "Length_cm": 115,
             "Height_cm": 100,
             "Weight_kg": 510,
+            "Allow_X": 0,
+            "Allow_Y": 0,
+            "Allow_Z": 0,
             "LBS_z": 510,
-            "Qty": 8,
-            "Priority_Level": 1,
-            "Color": "#2ca02c",
+            "Qty": 10,
+            "Color": "#e377c2",
         },
     ])
     return df_c, df_b
@@ -140,12 +149,36 @@ def get_actual_dims(item):
   return float(item.width), float(item.height), float(item.depth)
 
 
+# Map Allow_X, Allow_Y, Allow_Z from Master Data to allowed py3dbp rotation_types
+# py3dbp RotationTypes (where item initialized as W, H, D):
+# 0: (W, H, D) - Original upright
+# 1: (H, W, D) - Tipped sideways (roll around Z)
+# 2: (H, D, W) - Tipped & spun
+# 3: (D, H, W) - Horizontal spin (yaw around vertical Y axis: W <-> D)
+# 4: (D, W, H) - Tipped forward & spun
+# 5: (W, D, H) - Tipped forward (pitch around X axis: H <-> D)
+def get_allowed_rotations(allow_x, allow_y, allow_z):
+  allowed = [0]  # Original orientation is always allowed
+  if allow_z == 1 or allow_y == 1:
+    # Horizontal spin (Width <-> Length while keeping Height upright)
+    allowed.append(3)
+  if allow_x == 1:
+    # Tip forward/backward (Height <-> Length)
+    allowed.extend([4, 5])
+  if allow_x == 1 and (allow_y == 1 or allow_z == 1):
+    # Full 6-way orientation (e.g. Box B with Allow_X=1, Allow_Y=1, Allow_Z=1)
+    allowed = [0, 1, 2, 3, 4, 5]
+  return sorted(list(set(allowed)))
+
+
 # ------------------------------------------------------------------------------
 # 2. TOP WEIGHT LBSz SAFETY CHECK FOR PY3DBP
 # ------------------------------------------------------------------------------
-def check_py3dbp_lbsz_safety(candidate_item, candidate_pos, validated_items):
+def check_py3dbp_lbsz_safety(
+    candidate_item, candidate_pos, candidate_dim, validated_items
+):
   cx, cy, cz = candidate_pos
-  cw, ch, cd = get_actual_dims(candidate_item)
+  cw, ch, cd = candidate_dim
 
   if cy == 0:
     return True
@@ -231,6 +264,123 @@ def is_overlapping_3d(item1_pos, item1_dim, item2_pos, item2_dim):
   )
 
 
+def build_locked_bin(container_info, cw, ch, cl, max_w, locked_items):
+  temp_bin = Bin(str(container_info["Container_Name"]), cw, ch, cl, max_w)
+  for fitted in locked_items:
+    fw, fh, fd = get_actual_dims(fitted)
+    fixed_item = Item(
+        fitted.name,
+        Decimal(str(int(round(fw)))),
+        Decimal(str(int(round(fh)))),
+        Decimal(str(int(round(fd)))),
+        Decimal(str(fitted.weight)),
+    )
+    fixed_item.position = [
+        Decimal(str(int(round(float(p))))) for p in fitted.position
+    ]
+    fixed_item.rotation_type = 0
+    fixed_item.color = getattr(fitted, "color", "#7f7f7f")
+    fixed_item.box_id = getattr(fitted, "box_id", "UNKNOWN")
+    fixed_item.box_name = getattr(fitted, "box_name", "UNKNOWN")
+    fixed_item.customer_name = getattr(fitted, "customer_name", "UNKNOWN")
+    fixed_item.lbs_z = getattr(fitted, "lbs_z", float("inf"))
+    fixed_item.allowed_rotations = [0]
+    temp_bin.items.append(fixed_item)
+  return temp_bin
+
+
+def validate_and_compact_item(
+    item, validated_items, cw, ch, cl, support_surface_ratio
+):
+  ix, iy, iz = [float(p) for p in item.position]
+  orig_w, orig_h, orig_d = get_actual_dims(item)
+
+  # Build candidate dimension pairs to test (if horizontal rotation is allowed,
+  # try the proposed orientation first, then try swapping W <-> D if support fails)
+  allowed_rots = getattr(item, "allowed_rotations", [0])
+  can_spin_horiz = (3 in allowed_rots) or (len(allowed_rots) == 6)
+
+  dim_candidates = [(orig_w, orig_h, orig_d)]
+  if can_spin_horiz and abs(orig_w - orig_d) > 0.1:
+    dim_candidates.append((orig_d, orig_h, orig_w))
+
+  for cand_w, cand_h, cand_d in dim_candidates:
+    if ix + cand_w > cw + 0.1 or iz + cand_d > cl + 0.1:
+      continue
+
+    # 1. Slide backward along Z (remove artificial gaps behind the box)
+    compacted_z = 0.0
+    for val_item in validated_items:
+      vx, vy, vz = [float(p) for p in val_item.position]
+      vw, vh, vd = get_actual_dims(val_item)
+
+      x_overlap = max(0.0, min(ix + cand_w, vx + vw) - max(ix, vx))
+      y_overlap = max(0.0, min(iy + cand_h, vy + vh) - max(iy, vy))
+      if x_overlap > 0.1 and y_overlap > 0.1 and (vz + vd <= iz + 0.1):
+        if vz + vd > compacted_z:
+          compacted_z = vz + vd
+
+    test_z = compacted_z
+    if test_z + cand_d > cl + 0.1:
+      continue
+
+    # 2. Drop downward along Y (gravity & base support check at compacted Z)
+    max_underneath_y = 0.0
+    supporting_surface_area = 0.0
+
+    for val_item in validated_items:
+      vx, vy, vz = [float(p) for p in val_item.position]
+      vw, vh, vd = get_actual_dims(val_item)
+
+      x_overlap_len = max(0.0, min(ix + cand_w, vx + vw) - max(ix, vx))
+      z_overlap_len = max(0.0, min(test_z + cand_d, vz + vd) - max(test_z, vz))
+      overlap_area = x_overlap_len * z_overlap_len
+
+      if overlap_area > 0 and (vy + vh <= iy + 0.1):
+        top_y = vy + vh
+        if top_y > max_underneath_y:
+          max_underneath_y = top_y
+          supporting_surface_area = overlap_area
+
+    if max_underneath_y + cand_h > ch + 0.1:
+      continue
+
+    base_area = cand_w * cand_d
+    support_ratio = (
+        (supporting_surface_area / base_area) if max_underneath_y > 0 else 1.0
+    )
+
+    candidate_pos = [ix, max_underneath_y, test_z]
+    candidate_dim = [cand_w, cand_h, cand_d]
+
+    has_collision = False
+    for val_item in validated_items:
+      val_pos = [float(p) for p in val_item.position]
+      val_dim = list(get_actual_dims(val_item))
+      if is_overlapping_3d(candidate_pos, candidate_dim, val_pos, val_dim):
+        has_collision = True
+        break
+
+    is_lbsz_safe = check_py3dbp_lbsz_safety(
+        item, candidate_pos, candidate_dim, validated_items
+    )
+
+    if (
+        not has_collision
+        and (support_ratio >= support_surface_ratio)
+        and is_lbsz_safe
+    ):
+      # Apply validated dimensions & position
+      item.width = Decimal(str(int(round(cand_w))))
+      item.height = Decimal(str(int(round(cand_h))))
+      item.depth = Decimal(str(int(round(cand_d))))
+      item.rotation_type = 0
+      item.position = candidate_pos
+      return True
+
+  return False
+
+
 def run_py3dbp_packing_engine(
     container_info, user_box_orders, support_surface_ratio=0.85
 ):
@@ -244,6 +394,16 @@ def run_py3dbp_packing_engine(
   order_rows = []
   for item in user_box_orders:
     b = item["info"]
+    lbs_val = float(b.get("LBS_z", b.get("lbs_z", float("inf"))))
+    # Assign smart packing tier if Priority_Level is absent:
+    # Tier 1: Heavy/strong load-bearing pallets (LBS_z >= 500)
+    # Tier 2: Medium load-bearing boxes (10 < LBS_z < 500)
+    # Tier 3: Fragile / non-stackable top-only items (LBS_z <= 10, e.g., Box B with LBS_z=1)
+    if "Priority_Level" in b and not pd.isna(b["Priority_Level"]):
+      prio = int(b["Priority_Level"])
+    else:
+      prio = 1 if lbs_val >= 500 else (2 if lbs_val > 10 else 3)
+
     order_rows.append({
         "Box_ID": b["Box_ID"],
         "Box_Name": b.get("Box_Name", b["Box_ID"]),
@@ -252,9 +412,12 @@ def run_py3dbp_packing_engine(
         "Length_cm": float(b.get("Length_cm", 0)),
         "Height_cm": float(b.get("Height_cm", 0)),
         "Weight_kg": float(b.get("Weight_kg", 0)),
-        "LBS_z": float(b.get("LBS_z", b.get("lbs_z", float("inf")))),
+        "Allow_X": int(b.get("Allow_X", 0)),
+        "Allow_Y": int(b.get("Allow_Y", 0)),
+        "Allow_Z": int(b.get("Allow_Z", 1)),
+        "LBS_z": lbs_val,
         "Qty": int(item["qty"]),
-        "Priority_Level": int(b.get("Priority_Level", 2)),
+        "Priority_Level": prio,
         "Color": box_colors_map.get(b["Box_ID"], "#3380FF"),
     })
 
@@ -263,44 +426,26 @@ def run_py3dbp_packing_engine(
     return [], []
 
   box_df_sorted = box_orders_df.sort_values(
-      by=["Priority_Level", "Weight_kg", "Height_cm"],
+      by=["Priority_Level", "LBS_z", "Height_cm"],
       ascending=[True, False, False],
   )
-  all_fitted_items = []
 
-  # Group by Priority_Level so same-priority SKUs pack together in one pass
-  # (allowing Pallet D [100cm] to stack on top of Pallet C [120cm])
-  for priority_lvl, group_df in box_df_sorted.groupby(
-      "Priority_Level", sort=True
-  ):
+  validated_items = []
+  unfitted_pool = []
+
+  # Pass 1: Pack by Load-Bearing / Priority Tier, validating & compacting immediately
+  # so rejected boxes don't block empty space for subsequent tiers
+  for _, group_df in box_df_sorted.groupby("Priority_Level", sort=True):
     packer = Packer()
-    temp_bin = Bin(
-        str(container_info["Container_Name"]), cw, ch, cl, max_w
+    temp_bin = build_locked_bin(
+        container_info, cw, ch, cl, max_w, validated_items
     )
-
-    for fitted in all_fitted_items:
-      fw, fh, fd = get_actual_dims(fitted)
-      fixed_item = Item(
-          fitted.name,
-          Decimal(str(int(round(fw)))),
-          Decimal(str(int(round(fh)))),
-          Decimal(str(int(round(fd)))),
-          Decimal(str(fitted.weight)),
-      )
-      fixed_item.position = [
-          Decimal(str(int(round(float(p))))) for p in fitted.position
-      ]
-      fixed_item.rotation_type = 0
-      fixed_item.color = getattr(fitted, "color", "#7f7f7f")
-      fixed_item.box_id = getattr(fitted, "box_id", "UNKNOWN")
-      fixed_item.box_name = getattr(fitted, "box_name", "UNKNOWN")
-      fixed_item.customer_name = getattr(fitted, "customer_name", "UNKNOWN")
-      fixed_item.lbs_z = getattr(fitted, "lbs_z", float("inf"))
-      temp_bin.items.append(fixed_item)
-
     packer.add_bin(temp_bin)
 
     for _, row in group_df.iterrows():
+      allowed_rots = get_allowed_rotations(
+          row["Allow_X"], row["Allow_Y"], row["Allow_Z"]
+      )
       qty = int(row["Qty"])
       for i in range(qty):
         item = Item(
@@ -310,8 +455,9 @@ def run_py3dbp_packing_engine(
             int(row["Length_cm"]),
             float(row["Weight_kg"]),
         )
-        # Keep items upright (only allow horizontal Width <-> Length rotation)
-        item.updown = False
+        # Enable full rotation only if Allow_X=1; otherwise keep upright
+        item.updown = row["Allow_X"] == 1
+        item.allowed_rotations = allowed_rots
         item.color = str(row["Color"])
         item.box_id = str(row["Box_ID"])
         item.box_name = str(row["Box_Name"])
@@ -322,81 +468,85 @@ def run_py3dbp_packing_engine(
     packer.pack(
         bigger_first=True, distribute_items=False, number_of_decimals=0
     )
-    all_fitted_items = packer.bins[0].items
 
-  # Sort bottom-to-top, back-to-front, left-to-right before gravity & Z-compaction
-  all_fitted_items.sort(
-      key=lambda item: (
-          float(item.position[1]),
-          float(item.position[2]),
-          float(item.position[0]),
-      )
-  )
-
-  validated_items = []
-  for item in all_fitted_items:
-    ix, iy, iz = [float(p) for p in item.position]
-    iw, ih, id_len = get_actual_dims(item)
-
-    # 1. Slide backward along Z (remove artificial gaps behind the box)
-    compacted_z = 0.0
-    for val_item in validated_items:
-      vx, vy, vz = [float(p) for p in val_item.position]
-      vw, vh, vd = get_actual_dims(val_item)
-
-      x_overlap = max(0.0, min(ix + iw, vx + vw) - max(ix, vx))
-      y_overlap = max(0.0, min(iy + ih, vy + vh) - max(iy, vy))
-      if x_overlap > 0.1 and y_overlap > 0.1 and (vz + vd <= iz + 0.1):
-        if vz + vd > compacted_z:
-          compacted_z = vz + vd
-
-    iz = compacted_z
-
-    # 2. Drop downward along Y (gravity & base support check at compacted Z)
-    max_underneath_y = 0.0
-    supporting_surface_area = 0.0
-
-    for val_item in validated_items:
-      vx, vy, vz = [float(p) for p in val_item.position]
-      vw, vh, vd = get_actual_dims(val_item)
-
-      x_overlap_len = max(0.0, min(ix + iw, vx + vw) - max(ix, vx))
-      z_overlap_len = max(0.0, min(iz + id_len, vz + vd) - max(iz, vz))
-      overlap_area = x_overlap_len * z_overlap_len
-
-      if overlap_area > 0 and (vy + vh <= iy + 0.1):
-        top_y = vy + vh
-        if top_y > max_underneath_y:
-          max_underneath_y = top_y
-          supporting_surface_area = overlap_area
-
-    base_area = iw * id_len
-    support_ratio = (
-        (supporting_surface_area / base_area) if max_underneath_y > 0 else 1.0
+    newly_proposed = packer.bins[0].items[len(validated_items) :]
+    newly_proposed.sort(
+        key=lambda it: (
+            float(it.position[1]),
+            float(it.position[2]),
+            float(it.position[0]),
+        )
     )
 
-    candidate_pos = [ix, max_underneath_y, iz]
-    candidate_dim = [iw, ih, id_len]
+    for item in newly_proposed:
+      if not validate_and_compact_item(
+          item, validated_items, cw, ch, cl, support_surface_ratio
+      ):
+        unfitted_pool.append(item)
+      else:
+        validated_items.append(item)
 
-    has_collision = False
-    for val_item in validated_items:
-      val_pos = [float(p) for p in val_item.position]
-      val_dim = list(get_actual_dims(val_item))
-      if is_overlapping_3d(candidate_pos, candidate_dim, val_pos, val_dim):
-        has_collision = True
-        break
+    for unf in packer.bins[0].unfitted_items:
+      unfitted_pool.append(unf)
 
-    is_lbsz_safe = check_py3dbp_lbsz_safety(
-        item, candidate_pos, validated_items
+  # Pass 2: Retry any remaining unfitted boxes (including tipped/rotated orientations)
+  # into whatever gaps remain on top of pallets or along the side aisle
+  if unfitted_pool:
+    packer_retry = Packer()
+    retry_bin = build_locked_bin(
+        container_info, cw, ch, cl, max_w, validated_items
     )
+    packer_retry.add_bin(retry_bin)
 
-    if (
-        not has_collision
-        and (support_ratio >= support_surface_ratio)
-        and is_lbsz_safe
-    ):
-      item.position = candidate_pos
-      validated_items.append(item)
+    for item in unfitted_pool:
+      allowed_rots = getattr(item, "allowed_rotations", [0])
+      # If full 6-way rotation is allowed (e.g. Box B), pre-orient flattest/narrowest
+      # face (Height=40 -> Width=40) so it slides into the 55cm side lane
+      if len(allowed_rots) == 6:
+        dims = sorted([
+            int(round(float(item.width))),
+            int(round(float(item.height))),
+            int(round(float(item.depth))),
+        ])
+        # dims = [40, 60, 80] -> Width=40, Height=60, Length=80 (fits 55cm side aisle!)
+        retry_item = Item(
+            item.name, dims[0], dims[1], dims[2], float(item.weight)
+        )
+        retry_item.updown = True
+      else:
+        retry_item = Item(
+            item.name,
+            int(round(float(item.width))),
+            int(round(float(item.height))),
+            int(round(float(item.depth))),
+            float(item.weight),
+        )
+        retry_item.updown = getattr(item, "updown", False)
+
+      retry_item.allowed_rotations = allowed_rots
+      retry_item.color = getattr(item, "color", "#3380FF")
+      retry_item.box_id = getattr(item, "box_id", "N/A")
+      retry_item.box_name = getattr(item, "box_name", item.name)
+      retry_item.customer_name = getattr(item, "customer_name", "N/A")
+      retry_item.lbs_z = getattr(item, "lbs_z", float("inf"))
+      packer_retry.add_item(retry_item)
+
+    packer_retry.pack(
+        bigger_first=True, distribute_items=False, number_of_decimals=0
+    )
+    retry_proposed = packer_retry.bins[0].items[len(validated_items) :]
+    retry_proposed.sort(
+        key=lambda it: (
+            float(it.position[1]),
+            float(it.position[2]),
+            float(it.position[0]),
+        )
+    )
+    for item in retry_proposed:
+      if validate_and_compact_item(
+          item, validated_items, cw, ch, cl, support_surface_ratio
+      ):
+        validated_items.append(item)
 
   placed_boxes = []
   placed_counts = {}
