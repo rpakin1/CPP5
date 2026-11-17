@@ -274,7 +274,6 @@ def run_py3dbp_packing_engine(
     )
 
     for fitted in all_fitted_items:
-      # Use Decimal values so py3dbp's internal Decimal comparisons never raise TypeError
       fw, fh, fd = get_actual_dims(fitted)
       fixed_item = Item(
           fitted.name,
@@ -319,6 +318,7 @@ def run_py3dbp_packing_engine(
     )
     all_fitted_items = packer.bins[0].items
 
+  # Sort bottom-to-top, back-to-front, left-to-right before gravity & Z-compaction
   all_fitted_items.sort(
       key=lambda item: (
           float(item.position[1]),
@@ -332,6 +332,21 @@ def run_py3dbp_packing_engine(
     ix, iy, iz = [float(p) for p in item.position]
     iw, ih, id_len = get_actual_dims(item)
 
+    # 1. Slide backward along Z (remove artificial gaps behind the box)
+    compacted_z = 0.0
+    for val_item in validated_items:
+      vx, vy, vz = [float(p) for p in val_item.position]
+      vw, vh, vd = get_actual_dims(val_item)
+
+      x_overlap = max(0.0, min(ix + iw, vx + vw) - max(ix, vx))
+      y_overlap = max(0.0, min(iy + ih, vy + vh) - max(iy, vy))
+      if x_overlap > 0.1 and y_overlap > 0.1 and (vz + vd <= iz + 0.1):
+        if vz + vd > compacted_z:
+          compacted_z = vz + vd
+
+    iz = compacted_z
+
+    # 2. Drop downward along Y (gravity & base support check at compacted Z)
     max_underneath_y = 0.0
     supporting_surface_area = 0.0
 
