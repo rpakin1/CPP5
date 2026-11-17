@@ -72,7 +72,7 @@ def load_master_data():
             "Allow_Y": 0,
             "Allow_Z": 1,
             "LBS_z": 300,
-            "Qty": 10,
+            "Qty": 20,
             "Color": "#ff7f0e",
         },
         {
@@ -312,7 +312,6 @@ def validate_and_compact_item(
   if can_spin_horiz and abs(orig_w - orig_d) > 0.1:
     dim_candidates.append((orig_d, orig_h, orig_w))
   if len(allowed_rots) == 6:
-    # Also test all 6 permutations for full-rotation boxes (e.g., 40x80x60 vs 40x60x80)
     s_dims = sorted([orig_w, orig_h, orig_d])
     for perm in [
         (s_dims[0], s_dims[2], s_dims[1]),  # 40 x 80 x 60 (shortest Z footprint)
@@ -400,117 +399,30 @@ def validate_and_compact_item(
   return False
 
 
-def run_py3dbp_packing_engine(
-    container_info, user_box_orders, support_surface_ratio=0.85
+def run_tier_iterative_retry(
+    tier_unfitted_pool,
+    validated_items,
+    container_info,
+    cw,
+    ch,
+    cl,
+    max_w,
+    support_surface_ratio,
 ):
-  cw, ch, cl = (
-      int(container_info["Width_cm"]),
-      int(container_info["Height_cm"]),
-      int(container_info["Length_cm"]),
-  )
-  max_w = float(container_info.get("Max_Weight_kg", 28000))
+  """Iteratively packs and Z-compacts remaining items of the current tier
 
-  order_rows = []
-  for item in user_box_orders:
-    b = item["info"]
-    lbs_val = float(b.get("LBS_z", b.get("lbs_z", float("inf"))))
-    if "Priority_Level" in b and not pd.isna(b["Priority_Level"]):
-      prio = int(b["Priority_Level"])
-    else:
-      prio = 1 if lbs_val >= 500 else (2 if lbs_val > 10 else 3)
-
-    order_rows.append({
-        "Box_ID": b["Box_ID"],
-        "Box_Name": b.get("Box_Name", b["Box_ID"]),
-        "Customer_Name": b.get("Customer_Name", "N/A"),
-        "Width_cm": float(b.get("Width_cm", 0)),
-        "Length_cm": float(b.get("Length_cm", 0)),
-        "Height_cm": float(b.get("Height_cm", 0)),
-        "Weight_kg": float(b.get("Weight_kg", 0)),
-        "Allow_X": int(b.get("Allow_X", 0)),
-        "Allow_Y": int(b.get("Allow_Y", 0)),
-        "Allow_Z": int(b.get("Allow_Z", 1)),
-        "LBS_z": lbs_val,
-        "Qty": int(item["qty"]),
-        "Priority_Level": prio,
-        "Color": box_colors_map.get(b["Box_ID"], "#3380FF"),
-    })
-
-  box_orders_df = pd.DataFrame(order_rows)
-  if box_orders_df.empty:
-    return [], []
-
-  box_df_sorted = box_orders_df.sort_values(
-      by=["Priority_Level", "LBS_z", "Height_cm"],
-      ascending=[True, False, False],
-  )
-
-  validated_items = []
-  unfitted_pool = []
-
-  # Pass 1: Pack by Priority/Load-Bearing Tier with strict sheet rotation rules
-  for _, group_df in box_df_sorted.groupby("Priority_Level", sort=True):
-    packer = Packer()
-    temp_bin = build_locked_bin(
-        container_info, cw, ch, cl, max_w, validated_items
-    )
-    packer.add_bin(temp_bin)
-
-    for _, row in group_df.iterrows():
-      qty = int(row["Qty"])
-      for i in range(qty):
-        item = Item(
-            str(f"{row['Box_Name']} #{i+1}"),
-            int(row["Width_cm"]),
-            int(row["Height_cm"]),
-            int(row["Length_cm"]),
-            float(row["Weight_kg"]),
-        )
-        configure_item_rotations(
-            item, row["Allow_X"], row["Allow_Y"], row["Allow_Z"]
-        )
-        item.color = str(row["Color"])
-        item.box_id = str(row["Box_ID"])
-        item.box_name = str(row["Box_Name"])
-        item.customer_name = str(row["Customer_Name"])
-        item.lbs_z = float(row["LBS_z"])
-        packer.add_item(item)
-
-    packer.pack(
-        bigger_first=True, distribute_items=False, number_of_decimals=0
-    )
-
-    newly_proposed = packer.bins[0].items[len(validated_items) :]
-    newly_proposed.sort(
-        key=lambda it: (
-            float(it.position[1]),
-            float(it.position[2]),
-            float(it.position[0]),
-        )
-    )
-
-    for item in newly_proposed:
-      if not validate_and_compact_item(
-          item, validated_items, cw, ch, cl, support_surface_ratio
-      ):
-        unfitted_pool.append(item)
-      else:
-        validated_items.append(item)
-
-    for unf in packer.bins[0].unfitted_items:
-      unfitted_pool.append(unf)
-
-  # Pass 2+: Iteratively retry remaining unfitted boxes after Z-compaction
-  # opens new corner/aisle pivots (testing 40x80x60 first for full-rotation boxes)
+  until no more items of this tier can physically fit.
+  """
+  remaining = list(tier_unfitted_pool)
   for orientation_mode in ["compact_z", "compact_y"]:
-    while unfitted_pool:
+    while remaining:
       packer_retry = Packer()
       retry_bin = build_locked_bin(
           container_info, cw, ch, cl, max_w, validated_items
       )
       packer_retry.add_bin(retry_bin)
 
-      for item in unfitted_pool:
+      for item in remaining:
         allowed_rots = getattr(item, "allowed_rotations", [0])
         if len(allowed_rots) == 6:
           dims = sorted([
@@ -519,12 +431,10 @@ def run_py3dbp_packing_engine(
               int(round(float(item.depth))),
           ])
           if orientation_mode == "compact_z":
-            # 40 (W) x 80 (H) x 60 (L) -> fits 55cm aisle & uses only 60cm along Z
             retry_item = Item(
                 item.name, dims[0], dims[2], dims[1], float(item.weight)
             )
           else:
-            # 40 (W) x 60 (H) x 80 (L) -> lower height (60cm) for tighter vertical gaps
             retry_item = Item(
                 item.name, dims[0], dims[1], dims[2], float(item.weight)
             )
@@ -572,11 +482,140 @@ def run_py3dbp_packing_engine(
           placed_names.add(item.name)
           added_this_round += 1
 
-      unfitted_pool = [
-          it for it in unfitted_pool if it.name not in placed_names
-      ]
+      remaining = [it for it in remaining if it.name not in placed_names]
       if added_this_round == 0:
         break
+
+  return remaining
+
+
+def run_py3dbp_packing_engine(
+    container_info, user_box_orders, support_surface_ratio=0.85
+):
+  cw, ch, cl = (
+      int(container_info["Width_cm"]),
+      int(container_info["Height_cm"]),
+      int(container_info["Length_cm"]),
+  )
+  max_w = float(container_info.get("Max_Weight_kg", 28000))
+
+  order_rows = []
+  for item in user_box_orders:
+    b = item["info"]
+    lbs_val = float(b.get("LBS_z", b.get("lbs_z", float("inf"))))
+    if "Priority_Level" in b and not pd.isna(b["Priority_Level"]):
+      prio = int(b["Priority_Level"])
+    else:
+      prio = 1 if lbs_val >= 500 else (2 if lbs_val > 10 else 3)
+
+    order_rows.append({
+        "Box_ID": b["Box_ID"],
+        "Box_Name": b.get("Box_Name", b["Box_ID"]),
+        "Customer_Name": b.get("Customer_Name", "N/A"),
+        "Width_cm": float(b.get("Width_cm", 0)),
+        "Length_cm": float(b.get("Length_cm", 0)),
+        "Height_cm": float(b.get("Height_cm", 0)),
+        "Weight_kg": float(b.get("Weight_kg", 0)),
+        "Allow_X": int(b.get("Allow_X", 0)),
+        "Allow_Y": int(b.get("Allow_Y", 0)),
+        "Allow_Z": int(b.get("Allow_Z", 1)),
+        "LBS_z": lbs_val,
+        "Qty": int(item["qty"]),
+        "Priority_Level": prio,
+        "Color": box_colors_map.get(b["Box_ID"], "#3380FF"),
+    })
+
+  box_orders_df = pd.DataFrame(order_rows)
+  if box_orders_df.empty:
+    return [], []
+
+  box_df_sorted = box_orders_df.sort_values(
+      by=["Priority_Level", "LBS_z", "Height_cm"],
+      ascending=[True, False, False],
+  )
+
+  validated_items = []
+  global_unfitted_pool = []
+
+  # Pack and fully compact/retry each Priority/Load-Bearing Tier in order
+  # so Tier 2 (Box A) fills all 4 layers before Tier 3 (Box B) claims floor space
+  for _, group_df in box_df_sorted.groupby("Priority_Level", sort=True):
+    packer = Packer()
+    temp_bin = build_locked_bin(
+        container_info, cw, ch, cl, max_w, validated_items
+    )
+    packer.add_bin(temp_bin)
+
+    for _, row in group_df.iterrows():
+      qty = int(row["Qty"])
+      for i in range(qty):
+        item = Item(
+            str(f"{row['Box_Name']} #{i+1}"),
+            int(row["Width_cm"]),
+            int(row["Height_cm"]),
+            int(row["Length_cm"]),
+            float(row["Weight_kg"]),
+        )
+        configure_item_rotations(
+            item, row["Allow_X"], row["Allow_Y"], row["Allow_Z"]
+        )
+        item.color = str(row["Color"])
+        item.box_id = str(row["Box_ID"])
+        item.box_name = str(row["Box_Name"])
+        item.customer_name = str(row["Customer_Name"])
+        item.lbs_z = float(row["LBS_z"])
+        packer.add_item(item)
+
+    packer.pack(
+        bigger_first=True, distribute_items=False, number_of_decimals=0
+    )
+
+    newly_proposed = packer.bins[0].items[len(validated_items) :]
+    newly_proposed.sort(
+        key=lambda it: (
+            float(it.position[1]),
+            float(it.position[2]),
+            float(it.position[0]),
+        )
+    )
+
+    tier_unfitted = []
+    for item in newly_proposed:
+      if not validate_and_compact_item(
+          item, validated_items, cw, ch, cl, support_surface_ratio
+      ):
+        tier_unfitted.append(item)
+      else:
+        validated_items.append(item)
+
+    for unf in packer.bins[0].unfitted_items:
+      tier_unfitted.append(unf)
+
+    # Immediately run iterative retry for this tier before moving to the next tier
+    leftover_tier = run_tier_iterative_retry(
+        tier_unfitted,
+        validated_items,
+        container_info,
+        cw,
+        ch,
+        cl,
+        max_w,
+        support_surface_ratio,
+    )
+    global_unfitted_pool.extend(leftover_tier)
+
+  # Final sweep across any leftover items from earlier tiers into newly created gaps
+  if global_unfitted_pool:
+    run_tier_iterative_retry(
+        global_unfitted_pool,
+        validated_items,
+        container_info,
+        cw,
+        ch,
+        cl,
+        max_w,
+        support_surface_ratio,
+    )
 
   placed_boxes = []
   placed_counts = {}
