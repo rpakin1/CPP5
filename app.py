@@ -1,3 +1,4 @@
+from decimal import Decimal
 import math
 import pandas as pd
 import plotly.graph_objects as go
@@ -273,16 +274,18 @@ def run_py3dbp_packing_engine(
     )
 
     for fitted in all_fitted_items:
-      # Preserve exact already-rotated dimensions and lock orientation (rotation_type=0)
+      # Use Decimal values so py3dbp's internal Decimal comparisons never raise TypeError
       fw, fh, fd = get_actual_dims(fitted)
       fixed_item = Item(
           fitted.name,
-          int(round(fw)),
-          int(round(fh)),
-          int(round(fd)),
-          fitted.weight,
+          Decimal(str(int(round(fw)))),
+          Decimal(str(int(round(fh)))),
+          Decimal(str(int(round(fd)))),
+          Decimal(str(fitted.weight)),
       )
-      fixed_item.position = fitted.position
+      fixed_item.position = [
+          Decimal(str(int(round(float(p))))) for p in fitted.position
+      ]
       fixed_item.rotation_type = 0
       fixed_item.color = getattr(fitted, "color", "#7f7f7f")
       fixed_item.box_id = getattr(fitted, "box_id", "UNKNOWN")
