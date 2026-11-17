@@ -631,6 +631,7 @@ def plot_interactive_container(
     )
 
   fig.update_layout(
+      uirevision="constant",
       scene=dict(
           xaxis=dict(title="X: Width (cm)", range=[0, cw]),
           yaxis=dict(title="Y: Height (cm)", range=[0, ch]),
@@ -638,7 +639,7 @@ def plot_interactive_container(
           aspectmode="manual",
           aspectratio=dict(x=cw / cl, y=ch / cl, z=1.0),
           camera=dict(
-              eye=dict(x=-1.8, y=1.2, z=0.8), up=dict(x=0, y=1, z=0)
+              eye=dict(x=1.45, y=1.05, z=1.15), up=dict(x=0, y=1, z=0)
           ),
       ),
       margin=dict(r=0, l=0, b=0, t=10),
@@ -750,10 +751,18 @@ with tab_user:
     ):
       st.session_state.load_step = total_steps
 
-    btn_col, info_col = st.columns([1.4, 2.6])
-    with btn_col:
+    prev_col, next_col, info_col = st.columns([0.9, 0.9, 2.2])
+    with prev_col:
       if st.button(
-          "▶️ Next Loading Sequence",
+          "◀️ Prev",
+          use_container_width=True,
+          disabled=(total_steps == 0 or st.session_state.load_step <= 1),
+      ):
+        st.session_state.load_step -= 1
+
+    with next_col:
+      if st.button(
+          "Next ▶️",
           use_container_width=True,
           type="primary",
           disabled=(total_steps == 0),
