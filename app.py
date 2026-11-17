@@ -399,6 +399,135 @@ def validate_and_compact_item(
   return False
 
 
+def run_tier_iterative_retry(
+    tier_unfitted_pool,
+    validated_items,
+    container_info,
+    cw,
+    ch,
+    cl,
+    max_w,
+    support_surface_ratio,
+):
+  """Places remaining items of the current tier into every valid (Z, Y, X)
+
+  slot—including 4th-layer stacks on Box A and top-of-stack spaces—while
+  strictly enforcing Z-compaction, Support Surface Ratio, and LBSz limits.
+  """
+  remaining = list(tier_unfitted_pool)
+  if not remaining:
+    return []
+
+  def get_candidate_coords():
+    xs = sorted(
+        list(
+            set(
+                [0.0, 180.0]
+                + [
+                    round(float(it.position[0]) + get_actual_dims(it)[0], 1)
+                    for it in validated_items
+                ]
+            )
+        )
+    )
+    ys = sorted(
+        list(
+            set(
+                [0.0]
+                + [
+                    round(float(it.position[1]) + get_actual_dims(it)[1], 1)
+                    for it in validated_items
+                ]
+            )
+        )
+    )
+    zs = sorted(
+        list(
+            set(
+                [0.0]
+                + [
+                    round(float(it.position[2]) + get_actual_dims(it)[2], 1)
+                    for it in validated_items
+                ]
+            )
+        )
+    )
+    return (
+        [x for x in xs if x < cw],
+        [y for y in ys if y < ch],
+        [z for z in zs if z < cl],
+    )
+
+  still_unfitted = []
+  for item in remaining:
+    allowed_rots = getattr(item, "allowed_rotations", [0])
+    orig_w, orig_h, orig_d = get_actual_dims(item)
+
+    if len(allowed_rots) == 6:
+      s = sorted([orig_w, orig_h, orig_d])  # [40, 60, 80]
+      orientations = [
+          (s[0], s[2], s[1]),  # 40 (W) x 80 (H) x 60 (L)
+          (s[0], s[1], s[2]),  # 40 (W) x 60 (H) x 80 (L)
+          (s[1], s[0], s[2]),  # 60 (W) x 40 (H) x 80 (L)
+          (s[2], s[0], s[1]),  # 80 (W) x 40 (H) x 60 (L)
+      ]
+    elif 3 in allowed_rots and abs(orig_w - orig_d) > 0.1:
+      if orig_w <= orig_d:
+        orientations = [(orig_w, orig_h, orig_d), (orig_d, orig_h, orig_w)]
+      else:
+        orientations = [(orig_d, orig_h, orig_w), (orig_w, orig_h, orig_d)]
+    else:
+      orientations = [(orig_w, orig_h, orig_d)]
+
+    placed = False
+    xs, ys, zs = get_candidate_coords()
+
+    # Scan Back-to-Front (Z), Bottom-to-Top (Y), Left-to-Right (X)
+    for cz in zs:
+      if placed:
+        break
+      for cy in ys:
+        if placed:
+          break
+        for cx in xs:
+          if placed:
+            break
+          for cand_w, cand_h, cand_d in orientations:
+            if (
+                cx + cand_w > cw + 0.1
+                or cy + cand_h > ch + 0.1
+                or cz + cand_d > cl + 0.1
+            ):
+              continue
+
+            saved_w, saved_h, saved_d = item.width, item.height, item.depth
+            saved_pos = list(item.position)
+            saved_rots = list(getattr(item, "allowed_rotations", [0]))
+
+            item.width = Decimal(str(int(round(cand_w))))
+            item.height = Decimal(str(int(round(cand_h))))
+            item.depth = Decimal(str(int(round(cand_d))))
+            item.rotation_type = 0
+            configure_item_rotations(item, 0, 0, 0)
+            item.position = [cx, cy, cz]
+
+            if validate_and_compact_item(
+                item, validated_items, cw, ch, cl, support_surface_ratio
+            ):
+              validated_items.append(item)
+              placed = True
+              break
+            else:
+              item.width, item.height, item.depth = saved_w, saved_h, saved_d
+              item.position = saved_pos
+              item.allowed_rotations = saved_rots
+
+    if not placed:
+      still_unfitted.append(item)
+
+  return still_unfitted
+
+
 def run_py3dbp_packing_engine(
     container_info, user_box_orders, support_surface_ratio=0.85
 ):
@@ -445,9 +574,9 @@ def run_py3dbp_packing_engine(
   )
 
   validated_items = []
-  unfitted_pool = []
+  global_unfitted_pool = []
 
-  # Pass 1: Pack by Priority/Load-Bearing Tier with strict sheet rotation rules
+  # Pack and fully compact/retry each Priority/Load-Bearing Tier in order
   for _, group_df in box_df_sorted.groupby("Priority_Level", sort=True):
     packer = Packer()
     temp_bin = build_locked_bin(
@@ -488,93 +617,43 @@ def run_py3dbp_packing_engine(
         )
     )
 
+    tier_unfitted = []
     for item in newly_proposed:
       if not validate_and_compact_item(
           item, validated_items, cw, ch, cl, support_surface_ratio
       ):
-        unfitted_pool.append(item)
+        tier_unfitted.append(item)
       else:
         validated_items.append(item)
 
     for unf in packer.bins[0].unfitted_items:
-      unfitted_pool.append(unf)
+      tier_unfitted.append(unf)
 
-  # Pass 2: Retry remaining unfitted boxes (prioritizing higher LBS_z first,
-  # and keeping Box A at 40x50x30 so it stacks vertically instead of sprawling along Z)
-  unfitted_pool.sort(
-      key=lambda it: getattr(it, "lbs_z", 0.0), reverse=True
-  )
+    # Immediately run deterministic slot retry for this tier before moving to the next tier
+    leftover_tier = run_tier_iterative_retry(
+        tier_unfitted,
+        validated_items,
+        container_info,
+        cw,
+        ch,
+        cl,
+        max_w,
+        support_surface_ratio,
+    )
+    global_unfitted_pool.extend(leftover_tier)
 
-  for orientation_mode in ["compact_z", "compact_y"]:
-    while unfitted_pool:
-      packer_retry = Packer()
-      retry_bin = build_locked_bin(
-          container_info, cw, ch, cl, max_w, validated_items
-      )
-      packer_retry.add_bin(retry_bin)
-
-      for item in unfitted_pool:
-        allowed_rots = getattr(item, "allowed_rotations", [0])
-        if len(allowed_rots) == 6:
-          dims = sorted([
-              int(round(float(item.width))),
-              int(round(float(item.height))),
-              int(round(float(item.depth))),
-          ])
-          if orientation_mode == "compact_z":
-            retry_item = Item(
-                item.name, dims[0], dims[2], dims[1], float(item.weight)
-            )
-          else:
-            retry_item = Item(
-                item.name, dims[0], dims[1], dims[2], float(item.weight)
-            )
-          configure_item_rotations(retry_item, 1, 1, 1)
-        else:
-          # Keep narrow width (40cm) along X so Box A stacks 4-high cleanly
-          retry_item = Item(
-              item.name,
-              int(round(float(item.width))),
-              int(round(float(item.height))),
-              int(round(float(item.depth))),
-              float(item.weight),
-          )
-          configure_item_rotations(retry_item, 0, 0, 0)
-
-        retry_item.color = getattr(item, "color", "#3380FF")
-        retry_item.box_id = getattr(item, "box_id", "N/A")
-        retry_item.box_name = getattr(item, "box_name", item.name)
-        retry_item.customer_name = getattr(item, "customer_name", "N/A")
-        retry_item.lbs_z = getattr(item, "lbs_z", float("inf"))
-        packer_retry.add_item(retry_item)
-
-      packer_retry.pack(
-          bigger_first=True, distribute_items=False, number_of_decimals=0
-      )
-      retry_proposed = packer_retry.bins[0].items[len(validated_items) :]
-      retry_proposed.sort(
-          key=lambda it: (
-              float(it.position[1]),
-              float(it.position[2]),
-              float(it.position[0]),
-          )
-      )
-
-      added_this_round = 0
-      placed_names = set()
-      for item in retry_proposed:
-        if validate_and_compact_item(
-            item, validated_items, cw, ch, cl, support_surface_ratio
-        ):
-          validated_items.append(item)
-          placed_names.add(item.name)
-          added_this_round += 1
-
-      unfitted_pool = [
-          it for it in unfitted_pool if it.name not in placed_names
-      ]
-      if added_this_round == 0:
-        break
+  # Final sweep across any leftover items from earlier tiers into newly created gaps
+  if global_unfitted_pool:
+    run_tier_iterative_retry(
+        global_unfitted_pool,
+        validated_items,
+        container_info,
+        cw,
+        ch,
+        cl,
+        max_w,
+        support_surface_ratio,
+    )
 
   placed_boxes = []
   placed_counts = {}
